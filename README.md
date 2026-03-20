@@ -147,17 +147,18 @@ If that line never appears, the packets are not reaching the add-on.
 **Step 2 — Enable debug logging**
 
 Set `log_level: debug` in the add-on options and restart.  Every 30 seconds the
-add-on logs a one-line counter summary:
+add-on logs a one-line counter summary showing the activity during that interval
+(counters are reset after each summary, so each line is a delta, not a cumulative total):
 
 ```
-diag: recv=42 short=0 etype=0 ipv4=0 udp=0 ports=40 bootp=0 bootreq=0 cookie=0 opt53=0 msgtype=0 mac=2 matched=0
+diag: recv=42 short=0 etype=0 ipv4=0 udp=0 udp_trunc=0 ports=40 bootp=0 bootreq=0 cookie=0 opt53=0 msgtype=0 mac=2 matched=0 ok=0 fail=0
 ```
 
 Counter meanings:
 
 | Counter | Meaning |
 |---------|---------|
-| `recv` | Total raw Ethernet frames received |
+| `recv` | Total raw Ethernet frames received in this interval |
 | `short` | Frame too short to contain an Ethernet header |
 | `etype` | EtherType not IPv4 (0x0800) — e.g. ARP, IPv6, VLAN-tagged |
 | `ipv4` | IPv4 header truncated |
@@ -170,13 +171,18 @@ Counter meanings:
 | `opt53` | DHCP option 53 (message type) missing |
 | `msgtype` | DHCP message type not DISCOVER/REQUEST/INFORM |
 | `mac` | Valid DHCP packet but MAC not in tracked device list |
-| `matched` | Packets matched and sensor updated |
+| `matched` | Packets matched and sensor update attempted |
+| `ok` | Successful sensor updates sent to HA |
+| `fail` | Failed sensor update attempts |
 
 * If `recv=0` after a forced DHCP renewal, **no frames are reaching the add-on at all**.
   This is typically a Proxmox/VM bridge or firewall issue (see below).
 * If `recv` is growing but `matched=0`, look at which counter is increasing to
   identify the filtering stage.
 * If `etype` is growing, you may have VLAN-tagged frames (802.1Q) on the interface.
+* If `ports` or `udp` are growing while `matched=0`, the BPF filter may not be
+  working correctly in your environment — the add-on will automatically log a
+  **WARNING** after the first 30-second interval suggesting `disable_bpf: true`.
 
 **Step 3 — Check Proxmox bridge/firewall (VM setups)**
 
@@ -200,8 +206,20 @@ traffic (`pve-firewall status`).
 
 **Step 4 — Try disabling the BPF filter**
 
-If frames are arriving (debug `recv` counter grows) but are still not matched, try
-setting `disable_bpf: true` and restarting.  The add-on will then receive all
-Ethernet frames without the kernel BPF pre-filter, which can help rule out a
-BPF-related issue.  Remember to set it back to `false` once diagnostics are complete.
+If frames are arriving (debug `recv` counter grows) but the `ports` or `udp` counters
+are high and `matched=0`, the kernel BPF pre-filter may be ineffective in your
+environment.  The add-on detects this automatically: after the first 30-second
+diagnostic interval it logs a WARNING if more than half of all received frames were
+non-DHCP and no packets matched:
+
+```
+WARNING BPF filter may be ineffective: 120 frames received, 118 were non-DHCP
+(udp=10 ports=108), yet no packets matched. Try setting disable_bpf: true in add-on options.
+```
+
+When you see this warning, set `disable_bpf: true` and restart.  The add-on will then
+receive all Ethernet frames without the kernel BPF pre-filter, which resolves the issue
+in environments where BPF socket filters are restricted (e.g. some container runtimes or
+VMs).  Once the add-on is working you can leave `disable_bpf: true` permanently — the
+software filter still rejects non-DHCP frames efficiently.
 
