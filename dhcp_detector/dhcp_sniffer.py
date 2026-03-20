@@ -231,7 +231,7 @@ def main():
         stream=sys.stdout,
     )
 
-    # Load add-on options written by the Supervisor.
+    # Load app options written by the Supervisor.
     options_path = "/data/options.json"
     try:
         with open(options_path) as fh:
