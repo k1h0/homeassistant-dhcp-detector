@@ -45,6 +45,8 @@ class DiagCounters:
         "drop_msg_type",
         "drop_mac_not_tracked",
         "matched",
+        "sensor_update_success",
+        "sensor_update_fail",
     )
 
     def __init__(self):
@@ -60,17 +62,48 @@ class DiagCounters:
         with self._lock:
             return {s: getattr(self, s) for s in self.__slots__[1:]}
 
+    def snapshot_and_reset(self) -> dict:
+        """Atomically read and zero all counters; returns the pre-reset values."""
+        with self._lock:
+            snap = {s: getattr(self, s) for s in self.__slots__[1:]}
+            for slot in self.__slots__[1:]:
+                setattr(self, slot, 0)
+            return snap
+
 
 _counters = DiagCounters()
 
 
-def _diag_summary_thread(stop_event: threading.Event, interval: int = 30) -> None:
-    """Periodically log a one-line diagnostic summary at DEBUG level."""
+def _diag_summary_thread(
+    stop_event: threading.Event,
+    interval: int = 30,
+    disable_bpf: bool = False,
+) -> None:
+    """Periodically log a one-line diagnostic summary at DEBUG level.
+
+    Counters are reset after each summary so the values reflect the
+    activity during that interval (deltas), not cumulative totals.
+
+    When BPF is active (``disable_bpf=False``), a one-time WARNING is
+    emitted if many frames are being received but none match DHCP
+    client traffic, which suggests the BPF filter is not working as
+    expected in the current environment.
+    """
+    cumulative: dict = {s: 0 for s in DiagCounters.__slots__[1:]}
+    bpf_warn_emitted = False
+
     while not stop_event.wait(interval):
-        snap = _counters.snapshot()
+        snap = _counters.snapshot_and_reset()
+
+        # Accumulate lifetime totals for the BPF heuristic (independent of
+        # the per-interval reset so the heuristic sees the full picture).
+        for key in cumulative:
+            cumulative[key] += snap[key]
+
         logging.debug(
             "diag: recv=%d short=%d etype=%d ipv4=%d udp=%d udp_trunc=%d ports=%d "
-            "bootp=%d bootreq=%d cookie=%d opt53=%d msgtype=%d mac=%d matched=%d",
+            "bootp=%d bootreq=%d cookie=%d opt53=%d msgtype=%d mac=%d "
+            "matched=%d ok=%d fail=%d",
             snap["received"],
             snap["drop_too_short"],
             snap["drop_ethertype"],
@@ -85,7 +118,33 @@ def _diag_summary_thread(stop_event: threading.Event, interval: int = 30) -> Non
             snap["drop_msg_type"],
             snap["drop_mac_not_tracked"],
             snap["matched"],
+            snap["sensor_update_success"],
+            snap["sensor_update_fail"],
         )
+
+        # BPF effectiveness heuristic — emit a single warning if a
+        # meaningful number of frames have arrived but none of them look
+        # like DHCP client traffic, implying the BPF pre-filter is letting
+        # non-DHCP frames through (or is not filtering at all).
+        if not disable_bpf and not bpf_warn_emitted:
+            total_recv = cumulative["received"]
+            # Count frames that passed the BPF but were not DHCP UDP 68→67.
+            # (drop_not_udp: not a UDP packet; drop_ports: wrong UDP ports)
+            non_dhcp_udp = cumulative["drop_not_udp"] + cumulative["drop_ports"]
+            # Require at least 50 frames before drawing any conclusion and
+            # check that the majority are non-DHCP with no matches.
+            # Use multiplication to avoid float/integer division imprecision.
+            if total_recv >= 50 and non_dhcp_udp * 2 > total_recv and cumulative["matched"] == 0:
+                logging.warning(
+                    "BPF filter may be ineffective: %d frames received, %d were "
+                    "non-DHCP (udp=%d ports=%d), yet no packets matched. "
+                    "Try setting disable_bpf: true in add-on options.",
+                    total_recv,
+                    non_dhcp_udp,
+                    cumulative["drop_not_udp"],
+                    cumulative["drop_ports"],
+                )
+                bpf_warn_emitted = True
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -175,38 +234,32 @@ def parse_dhcp_packet(data: bytes):
     # --- Ethernet header (14 bytes) ---
     if len(data) < 14:
         _counters.inc("drop_too_short")
-        logging.debug("drop: frame too short (%d bytes)", len(data))
         return None
     ethertype = struct.unpack_from("!H", data, 12)[0]
     if ethertype != ETHERTYPE_IPV4:
         _counters.inc("drop_ethertype")
-        logging.debug("drop: ethertype=0x%04x (not IPv4)", ethertype)
         return None
 
     # --- IPv4 header ---
     ip_start = 14
     if len(data) < ip_start + 20:
         _counters.inc("drop_not_ipv4")
-        logging.debug("drop: IPv4 header truncated")
         return None
     ip_ihl = (data[ip_start] & 0x0F) * 4
     ip_proto = data[ip_start + 9]
     if ip_proto != IP_PROTO_UDP:
         _counters.inc("drop_not_udp")
-        logging.debug("drop: IP proto=%d (not UDP)", ip_proto)
         return None
 
     # --- UDP header (8 bytes) ---
     udp_start = ip_start + ip_ihl
     if len(data) < udp_start + 8:
         _counters.inc("drop_udp_truncated")
-        logging.debug("drop: UDP header truncated")
         return None
     src_port = struct.unpack_from("!H", data, udp_start)[0]
     dst_port = struct.unpack_from("!H", data, udp_start + 2)[0]
     if src_port != DHCP_CLIENT_PORT or dst_port != DHCP_SERVER_PORT:
         _counters.inc("drop_ports")
-        logging.debug("drop: UDP ports %d→%d (need 68→67)", src_port, dst_port)
         return None
 
     # --- BOOTP / DHCP payload ---
@@ -214,13 +267,11 @@ def parse_dhcp_packet(data: bytes):
     bootp_start = udp_start + 8
     if len(data) < bootp_start + 240:
         _counters.inc("drop_bootp_len")
-        logging.debug("drop: BOOTP payload too short")
         return None
 
     # op == 1: BOOTREQUEST (client → server)
     if data[bootp_start] != 1:
         _counters.inc("drop_not_bootrequest")
-        logging.debug("drop: BOOTP op=%d (not BOOTREQUEST)", data[bootp_start])
         return None
 
     # Client hardware address (MAC) is at offset 28 inside BOOTP, 6 bytes.
@@ -232,7 +283,6 @@ def parse_dhcp_packet(data: bytes):
     magic = struct.unpack_from("!I", data, bootp_start + 236)[0]
     if magic != BOOTP_MAGIC_COOKIE:
         _counters.inc("drop_magic_cookie")
-        logging.debug("drop: bad BOOTP magic cookie 0x%08x", magic)
         return None
 
     # --- Parse DHCP options to find message type (option 53) ---
@@ -257,7 +307,6 @@ def parse_dhcp_packet(data: bytes):
 
     if dhcp_type is None:
         _counters.inc("drop_no_opt53")
-        logging.debug("drop: DHCP option 53 (message type) not found")
         return None
 
     return mac, dhcp_type
@@ -401,6 +450,7 @@ def main():
     diag_thread = threading.Thread(
         target=_diag_summary_thread,
         args=(stop_event,),
+        kwargs={"disable_bpf": disable_bpf},
         daemon=True,
         name="diag-summary",
     )
@@ -424,11 +474,9 @@ def main():
         mac, dhcp_type = result
         if dhcp_type not in TRACKED_MSG_TYPES:
             _counters.inc("drop_msg_type")
-            logging.debug("drop: DHCP message type %d not tracked", dhcp_type)
             continue
         if mac not in device_map:
             _counters.inc("drop_mac_not_tracked")
-            logging.debug("drop: MAC %s not in tracked device list", mac)
             continue
 
         _counters.inc("matched")
@@ -445,7 +493,11 @@ def main():
             dev_id,  # log the actual entity ID that will be written
         )
 
-        update_sensor(token, mac, name)
+        ok = update_sensor(token, mac, name)
+        if ok:
+            _counters.inc("sensor_update_success")
+        else:
+            _counters.inc("sensor_update_fail")
 
     sock.close()
     logging.info("DHCP Detector stopped.")
