@@ -10,6 +10,7 @@ state to Home Assistant via the Supervisor REST API (device_tracker/see).
 import json
 import logging
 import os
+import signal
 import socket
 import struct
 import sys
@@ -154,10 +155,10 @@ def report_presence(token: str, mac: str, dev_id: str, location: str) -> bool:
 # Away timeout checker
 # ---------------------------------------------------------------------------
 
-def away_checker(token: str, device_map: dict, last_seen: dict, lock: threading.Lock, away_timeout: int):
+def away_checker(token: str, device_map: dict, last_seen: dict, lock: threading.Lock,
+                 away_timeout: int, stop_event: threading.Event):
     """Background daemon: mark devices as not_home after away_timeout seconds of silence."""
-    while True:
-        time.sleep(30)
+    while not stop_event.wait(timeout=30):
         now = time.time()
         timed_out = []
         with lock:
@@ -223,19 +224,30 @@ def main():
     # last_seen tracks the timestamp of the most recent DHCP packet per MAC.
     last_seen: dict[str, float] = {}
     lock = threading.Lock()
+    stop_event = threading.Event()
+
+    def handle_shutdown_signal(signum, frame):
+        logging.info("Received signal %s — shutting down.", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    signal.signal(signal.SIGINT, handle_shutdown_signal)
 
     # Start away-timeout background thread.
     t = threading.Thread(
         target=away_checker,
-        args=(token, device_map, last_seen, lock, away_timeout),
+        args=(token, device_map, last_seen, lock, away_timeout, stop_event),
         daemon=True,
     )
     t.start()
 
     # Open a raw AF_PACKET socket bound to the chosen interface.
-    # We filter for IPv4 (ETH_P_IP = 0x0800) at the socket level to reduce noise.
+    # AF_PACKET operates at Ethernet layer 2 and does NOT bind to any UDP/TCP
+    # port, so it never interferes with the existing DHCP server on ports 67/68.
+    # A 1-second receive timeout keeps the loop interruptible by signals.
     try:
         sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETHERTYPE_IPV4))
+        sock.settimeout(1.0)
         sock.bind((interface, 0))
     except PermissionError:
         logging.error("Permission denied opening raw socket. Ensure CAP_NET_RAW is granted.")
@@ -246,9 +258,12 @@ def main():
 
     logging.info("Listening on %s …", interface)
 
-    while True:
+    while not stop_event.is_set():
         try:
             data, _ = sock.recvfrom(65535)
+        except socket.timeout:
+            # No packet in the last second — loop back and check stop_event.
+            continue
         except OSError as exc:
             logging.error("Socket read error: %s", exc)
             time.sleep(1)
@@ -277,6 +292,9 @@ def main():
         with lock:
             last_seen[mac] = time.time()
         report_presence(token, mac, name, "home")
+
+    sock.close()
+    logging.info("DHCP Detector stopped.")
 
 
 if __name__ == "__main__":
