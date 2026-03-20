@@ -54,6 +54,11 @@ SOL_SOCKET = 1
 SO_ATTACH_FILTER = 26
 
 
+def sanitize_dev_id(name: str) -> str:  # extracted from duplicated inline expressions
+    """Convert a friendly device name to a valid HA entity ID segment."""
+    return re.sub(r"[^a-z0-9_]", "_", name.lower()).strip("_")
+
+
 def attach_bpf(sock: socket.socket) -> None:
     """Attach a BPF filter to *sock* restricting delivery to UDP port 67/68.
 
@@ -183,7 +188,7 @@ def update_sensor(token: str, mac: str, name: str) -> bool:
     Returns True on success, False on error.
     """
     # Sanitize name → valid HA entity ID segment (lowercase, only a-z/0-9/_).
-    dev_id = re.sub(r"[^a-z0-9_]", "_", name.lower()).strip("_")
+    dev_id = sanitize_dev_id(name)  # deduplicated via module-level helper
     timestamp = datetime.now().astimezone().isoformat()
     payload = json.dumps({
         "state": timestamp,
@@ -253,7 +258,8 @@ def main():
     logging.info("DHCP Detector starting — interface=%s, tracking %d device(s)",
                  interface, len(device_map))
     for mac, name in device_map.items():
-        logging.info("  tracking: %s → %s (sensor.dhcp_last_seen_%s)", mac, name, name)
+        dev_id = sanitize_dev_id(name)  # sanitized entity ID used in the log
+        logging.info("  tracking: %s → %s (sensor.dhcp_last_seen_%s)", mac, name, dev_id)
 
     stop_event = threading.Event()
 
@@ -306,7 +312,7 @@ def main():
 
         name = device_map[mac]
         # Derive the sanitized entity ID the same way update_sensor does.
-        dev_id = re.sub(r"[^a-z0-9_]", "_", name.lower()).strip("_")
+        dev_id = sanitize_dev_id(name)  # deduplicated via module-level helper
         type_name = MSG_TYPE_NAMES.get(dhcp_type, str(dhcp_type))
         logging.info(
             "%s  DHCP %-8s  %s (%s) → sensor.dhcp_last_seen_%s",
