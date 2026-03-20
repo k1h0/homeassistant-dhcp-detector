@@ -16,7 +16,7 @@ host_network: true
 capabilities:
   - NET_RAW
 
-# Grants the add-on access to the HA Core REST API via the Supervisor proxy.
+# Grants the app access to the HA Core REST API via the Supervisor proxy.
 homeassistant_api: true
 
 startup: application
