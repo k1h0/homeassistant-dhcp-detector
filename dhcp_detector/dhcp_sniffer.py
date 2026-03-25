@@ -8,6 +8,7 @@ timestamp sensor state to Home Assistant via MQTT Discovery.
 """
 
 import ctypes
+import os
 import re
 import json
 import logging
@@ -168,6 +169,19 @@ SO_ATTACH_FILTER = 26
 _PCAP_ERRBUF_SIZE = 256
 _PCAP_NETMASK_UNKNOWN = 0xFFFFFFFF
 _FILTER_EXPR = b"udp and (port 67 or port 68)"
+
+# Maximum time (seconds) to wait for the initial MQTT CONNACK on startup.
+MQTT_CONNECT_TIMEOUT = 30
+
+# Add-on version reported in the MQTT device registry.
+# NOTE: config.yaml is not copied into the Docker image, so the version cannot
+# be read at runtime. Keep this constant in sync with config.yaml manually.
+ADDON_VERSION = "1.1.1"
+
+# Interval (seconds) between periodic availability heartbeat publishes.
+# Ensures the sensor stays "online" in HA even during long quiet periods
+# when no DHCP activity triggers any MQTT publishes.
+AVAILABILITY_HEARTBEAT_INTERVAL = 300
 
 
 class _BpfInsn(ctypes.Structure):
@@ -383,34 +397,104 @@ def parse_dhcp_packet(data: bytes):
 
 
 # ---------------------------------------------------------------------------
+# Availability heartbeat
+# ---------------------------------------------------------------------------
+
+
+def _availability_heartbeat_thread(
+    stop_event: threading.Event,
+    client: mqtt_client.Client,
+    interval: int = AVAILABILITY_HEARTBEAT_INTERVAL,
+) -> None:
+    """Periodically re-publish the availability 'online' message.
+
+    Ensures the sensor stays available in HA even during long quiet periods
+    when no DHCP activity triggers any other MQTT publishes.  The retained
+    message on the broker is refreshed every *interval* seconds so that a
+    broker restart or brief HA disconnect recovers without manual intervention.
+    """
+    while not stop_event.wait(interval):
+        logging.debug("Heartbeat: re-publishing availability 'online'")
+        publish_availability(client, available=True)
+
+
+# ---------------------------------------------------------------------------
 # MQTT helpers
 # ---------------------------------------------------------------------------
 
 # Shared availability topic for all sensors managed by this add-on.
 AVAILABILITY_TOPIC = "dhcp_presence/availability"
 
+# Device object shared by all discovery payloads — groups every tracked-device
+# sensor under a single "DHCP Detector" entry in the HA device registry.
+DISCOVERY_DEVICE = {
+    "identifiers": ["dhcp_detector"],
+    "name": "DHCP Detector",
+    "model": "DHCP Detector",
+    "manufacturer": "Home Assistant Add-on",
+    "sw_version": ADDON_VERSION,
+}
 
-def mqtt_connect(host: str, port: int, username: str, password: str) -> mqtt_client.Client:
-    """Create and connect a paho MQTT client.
 
-    Returns the connected client instance.
+def mqtt_connect(
+    host: str,
+    port: int,
+    username: str,
+    password: str,
+    device_map: dict,
+) -> tuple:
+    """Create and connect a paho MQTT client with automatic reconnect.
+
+    Registers ``on_connect`` and ``on_disconnect`` callbacks so that MQTT
+    Discovery configs and the "online" availability message are (re-)published
+    every time the connection is (re-)established.
+
+    Returns ``(client, connected_event)`` where ``connected_event`` is a
+    :class:`threading.Event` that is set as soon as the first successful
+    CONNACK is received.
     """
-    client = mqtt_client.Client()
+    connected_event = threading.Event()
+
+    def on_connect(client, userdata, connect_flags, reason_code, properties):
+        if not reason_code.is_failure:
+            if connected_event.is_set():
+                logging.info("Reconnected to MQTT broker at %s:%d", host, port)
+            else:
+                logging.info("Connected to MQTT broker at %s:%d", host, port)
+            publish_discovery(client, device_map)
+            publish_availability(client, available=True)
+            connected_event.set()
+        else:
+            logging.error("MQTT connection refused (reason=%s)", reason_code)
+
+    def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+        if reason_code.is_failure:
+            logging.warning(
+                "MQTT broker connection lost (reason=%s) — reconnecting…",
+                reason_code,
+            )
+
+    client = mqtt_client.Client(
+        callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2,
+    )
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     # Set last-will so the broker publishes "offline" if the connection drops unexpectedly.
     client.will_set(AVAILABILITY_TOPIC, payload="offline", retain=True)
+    # Retry with exponential back-off (1 s → 30 s) on connection loss.
+    client.reconnect_delay_set(min_delay=1, max_delay=30)
     if username:
         client.username_pw_set(username, password or None)
     client.connect(host, port, keepalive=60)
     client.loop_start()
-    logging.info("Connected to MQTT broker at %s:%d", host, port)
-    return client
+    return client, connected_event
 
 
 def publish_discovery(client: mqtt_client.Client, device_map: dict) -> None:
     """Publish retained MQTT Discovery config messages for each tracked device.
 
     Registers a persistent timestamp sensor in HA for every entry in device_map.
-    Called once on startup before the availability "online" message is sent.
+    Called automatically in ``on_connect`` (initial connection and every reconnect).
     """
     for _mac, name in device_map.items():
         dev_id = sanitize_dev_id(name)
@@ -423,6 +507,7 @@ def publish_discovery(client: mqtt_client.Client, device_map: dict) -> None:
             "availability_topic": AVAILABILITY_TOPIC,
             "payload_available": "online",
             "payload_not_available": "offline",
+            "device": DISCOVERY_DEVICE,
         })
         client.publish(topic, payload=payload, retain=True)
         logging.info("Published discovery config for sensor.dhcp_last_seen_%s", dev_id)
@@ -431,7 +516,7 @@ def publish_discovery(client: mqtt_client.Client, device_map: dict) -> None:
 def publish_availability(client: mqtt_client.Client, available: bool) -> None:
     """Publish the add-on availability (online/offline) with retain=True.
 
-    Called after discovery on startup ("online") and on shutdown ("offline").
+    Called automatically in ``on_connect`` ("online") and on shutdown ("offline").
     """
     payload = "online" if available else "offline"
     client.publish(AVAILABILITY_TOPIC, payload=payload, retain=True)
@@ -441,8 +526,8 @@ def publish_availability(client: mqtt_client.Client, available: bool) -> None:
 def publish_state(client: mqtt_client.Client, mac: str, name: str) -> bool:
     """Publish a retained ISO 8601 timestamp to the device's state topic.
 
-    Replaces the former update_sensor() REST API call.
-    Returns True on success, False on error.
+    Returns True on success, False when the broker is temporarily unreachable
+    (e.g. during an automatic reconnect attempt).
     """
     dev_id = sanitize_dev_id(name)  # deduplicated via module-level helper
     timestamp = datetime.now().astimezone().isoformat()
@@ -452,7 +537,7 @@ def publish_state(client: mqtt_client.Client, mac: str, name: str) -> bool:
         result.wait_for_publish(timeout=5)
         return True
     except (ValueError, RuntimeError) as exc:
-        logging.error("MQTT publish error for %s (%s): %s", name, mac, exc)
+        logging.warning("MQTT publish skipped for %s (%s): %s", name, mac, exc)
         return False
 
 
@@ -482,11 +567,24 @@ def main():
     devices = options.get("devices", [])
     log_level_str = options.get("log_level", "info").upper()
     disable_bpf = options.get("disable_bpf", False)
-    # MQTT broker connection settings from add-on options
-    mqtt_host = options.get("mqtt_host", "core-mosquitto")
-    mqtt_port = options.get("mqtt_port", 1883)
-    mqtt_username = options.get("mqtt_username", "")
-    mqtt_password = options.get("mqtt_password", "")
+    # MQTT broker settings — read from HA Supervisor service-discovery environment
+    # variables injected automatically when `services: mqtt:need` is declared.
+    # Fall back to options.json values for backward compatibility.
+    mqtt_host = (
+        os.environ.get("MQTT_HOST")
+        or options.get("mqtt_host", "core-mosquitto")
+    )
+    mqtt_port = int(
+        os.environ.get("MQTT_PORT") or options.get("mqtt_port", 1883) or 1883
+    )
+    mqtt_username = (
+        os.environ.get("MQTT_USERNAME")
+        or options.get("mqtt_username", "")
+    )
+    mqtt_password = (
+        os.environ.get("MQTT_PASSWORD")
+        or options.get("mqtt_password", "")
+    )
 
     # Reconfigure logging with the user-chosen level.
     numeric_level = getattr(logging, log_level_str, logging.INFO)
@@ -510,17 +608,22 @@ def main():
         logging.info("BPF filter disabled — running unfiltered capture (disable_bpf=true)")
     logging.debug("log_level=%s disable_bpf=%s", log_level_str, disable_bpf)
 
-    # Connect to MQTT broker and publish discovery configs + "online" availability.
+    # Connect to MQTT broker; discovery configs and "online" availability are
+    # published automatically inside the on_connect callback (also on reconnect).
     try:
-        mqttc = mqtt_connect(mqtt_host, mqtt_port, mqtt_username, mqtt_password)
+        mqttc, mqtt_connected = mqtt_connect(
+            mqtt_host, mqtt_port, mqtt_username, mqtt_password, device_map
+        )
     except Exception as exc:
         logging.error("Failed to connect to MQTT broker at %s:%d: %s", mqtt_host, mqtt_port, exc)
         sys.exit(1)
 
-    # Publish retained discovery config for each tracked device once on startup.
-    publish_discovery(mqttc, device_map)
-    # Signal that the add-on is online; HA marks all sensors available via availability_topic.
-    publish_availability(mqttc, available=True)
+    # Wait for the initial CONNACK + discovery/availability publish to complete.
+    if not mqtt_connected.wait(timeout=MQTT_CONNECT_TIMEOUT):
+        logging.warning(
+            "MQTT initial connection not established within %d s — continuing anyway",
+            MQTT_CONNECT_TIMEOUT,
+        )
 
     stop_event = threading.Event()
 
@@ -564,6 +667,16 @@ def main():
         name="diag-summary",
     )
     diag_thread.start()
+
+    # Start background thread that periodically re-publishes availability "online".
+    # This keeps the sensor visible in HA even when no DHCP events occur for hours.
+    heartbeat_thread = threading.Thread(
+        target=_availability_heartbeat_thread,
+        args=(stop_event, mqttc),
+        daemon=True,
+        name="avail-heartbeat",
+    )
+    heartbeat_thread.start()
 
     while not stop_event.is_set():
         try:

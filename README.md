@@ -69,10 +69,12 @@ Alternatively, copy the `dhcp_detector/` directory into your
 | `devices` | `list` | `[]` | List of `{ mac, name }` pairs to track (see below). |
 | `log_level` | `string` | `info` | Logging verbosity: `debug`, `info`, `warning`, or `error`. Use `debug` to enable detailed diagnostics. |
 | `disable_bpf` | `bool` | `false` | When `true`, the BPF kernel filter is not attached. Useful when troubleshooting missing packets. |
-| `mqtt_host` | `string` | `core-mosquitto` | Hostname or IP address of the MQTT broker. Use the default for the Mosquitto add-on. |
-| `mqtt_port` | `integer` | `1883` | TCP port of the MQTT broker. |
-| `mqtt_username` | `string` | `""` | MQTT username (leave empty if authentication is not required). |
-| `mqtt_password` | `string` | `""` | MQTT password (leave empty if authentication is not required). |
+
+> **MQTT connection settings are configured automatically.**  
+> When the Mosquitto broker add-on is running, the HA Supervisor injects the
+> correct host, port, username, and password as environment variables
+> (`MQTT_HOST`, `MQTT_PORT`, `MQTT_USERNAME`, `MQTT_PASSWORD`) — no manual
+> MQTT configuration is required.
 
 ### Devices list example
 
